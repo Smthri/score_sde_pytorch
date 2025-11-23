@@ -235,7 +235,16 @@ def train(config, workdir):
 
     for step in range(initial_step, num_train_steps + 1):
         # Convert data to PyTorch tensors and normalize them.
-        batch_dict = next(train_iter)
+        # Handle StopIteration when epoch ends by recreating the iterator
+        try:
+            batch_dict = next(train_iter)
+        except StopIteration:
+            logging.info(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Training epoch finished, recreating iterator at step {step}"
+            )
+            train_iter = iter(train_ds)
+            batch_dict = next(train_iter)
+        
         batch = batch_dict["image"].to(config.device).float()
         # Data is already in [B, H, W, C] format from datasets.py, convert to [B, C, H, W]
         if batch.dim() == 4 and batch.shape[-1] == 3:
@@ -258,7 +267,16 @@ def train(config, workdir):
 
         # Report the loss on an evaluation dataset periodically
         if step % config.training.eval_freq == 0:
-            eval_batch_dict = next(eval_iter)
+            # Handle StopIteration when eval epoch ends by recreating the iterator
+            try:
+                eval_batch_dict = next(eval_iter)
+            except StopIteration:
+                logging.info(
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Eval epoch finished, recreating iterator at step {step}"
+                )
+                eval_iter = iter(eval_ds)
+                eval_batch_dict = next(eval_iter)
+            
             eval_batch = eval_batch_dict["image"].to(config.device).float()
             # Data is already in [B, H, W, C] format from datasets.py, convert to [B, C, H, W]
             if eval_batch.dim() == 4 and eval_batch.shape[-1] == 3:
