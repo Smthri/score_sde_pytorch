@@ -21,6 +21,8 @@ from absl import flags
 from ml_collections.config_flags import config_flags
 import logging
 import os
+import sys
+from datetime import datetime
 
 FLAGS = flags.FLAGS
 
@@ -34,21 +36,45 @@ flags.mark_flags_as_required(["workdir", "config", "mode"])
 
 
 def main(argv):
+  # Configure logging to output to both stdout and file
+  logger = logging.getLogger()
+  logger.setLevel(logging.INFO)
+  
+  # Remove existing handlers to avoid duplicates
+  logger.handlers = []
+  
+  # Create formatter with timestamp
+  formatter = logging.Formatter('%(message)s')
+  
+  # Handler for stdout
+  stdout_handler = logging.StreamHandler(sys.stdout)
+  stdout_handler.setFormatter(formatter)
+  logger.addHandler(stdout_handler)
+  
   if FLAGS.mode == "train":
     # Create the working directory
     os.makedirs(FLAGS.workdir, exist_ok=True)
     # Set logger so that it outputs to both console and file
-    # Make logging work for both disk and Google Cloud Storage
-    gfile_stream = open(os.path.join(FLAGS.workdir, 'stdout.txt'), 'w')
-    handler = logging.StreamHandler(gfile_stream)
-    formatter = logging.Formatter('%(levelname)s - %(filename)s - %(asctime)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger = logging.getLogger()
-    logger.addHandler(handler)
-    logger.setLevel('INFO')
+    log_file = os.path.join(FLAGS.workdir, 'stdout.txt')
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting training mode")
+    logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Config file: {FLAGS.config}")
+    logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Work directory: {FLAGS.workdir}")
     # Run the training pipeline
     run_lib.train(FLAGS.config, FLAGS.workdir)
   elif FLAGS.mode == "eval":
+    # Create the working directory if it doesn't exist
+    os.makedirs(FLAGS.workdir, exist_ok=True)
+    log_file = os.path.join(FLAGS.workdir, 'eval_stdout.txt')
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting evaluation mode")
+    logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Config file: {FLAGS.config}")
+    logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Work directory: {FLAGS.workdir}")
+    logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Eval folder: {FLAGS.eval_folder}")
     # Run the evaluation pipeline
     run_lib.evaluate(FLAGS.config, FLAGS.workdir, FLAGS.eval_folder)
   else:

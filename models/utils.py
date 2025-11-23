@@ -19,6 +19,8 @@
 import torch
 import sde_lib
 import numpy as np
+import logging
+from datetime import datetime
 
 
 _MODELS = {}
@@ -88,9 +90,13 @@ def get_ddpm_params(config):
 def create_model(config):
   """Create the score model."""
   model_name = config.model.name
+  logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Creating model: {model_name}")
+  logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Model config - nf: {config.model.nf}, num_scales: {config.model.num_scales}")
   score_model = get_model(model_name)(config)
+  logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Model instantiated, moving to device: {config.device}")
   score_model = score_model.to(config.device)
   score_model = torch.nn.DataParallel(score_model)
+  logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Model wrapped with DataParallel")
   return score_model
 
 
