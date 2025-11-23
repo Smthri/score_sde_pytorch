@@ -177,9 +177,6 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
   def step_fn(state, batch):
     """Running one step of training or evaluation.
 
-    This function will undergo `jax.lax.scan` so that multiple steps can be pmapped and jit-compiled together
-    for faster execution.
-
     Args:
       state: A dictionary of training information, containing the score model, optimizer,
        EMA status, and number of optimization steps.

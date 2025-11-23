@@ -14,30 +14,86 @@
 # limitations under the License.
 
 """Utility functions for computing FID/Inception scores."""
-
-import jax
 import numpy as np
-import six
-import tensorflow as tf
-import tensorflow_gan as tfgan
-import tensorflow_hub as tfhub
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import inception_v3
+from scipy import linalg
+import os
 
-INCEPTION_TFHUB = 'https://tfhub.dev/tensorflow/tfgan/eval/inception/1'
-INCEPTION_OUTPUT = 'logits'
-INCEPTION_FINAL_POOL = 'pool_3'
-_DEFAULT_DTYPES = {
-  INCEPTION_OUTPUT: tf.float32,
-  INCEPTION_FINAL_POOL: tf.float32
-}
+
 INCEPTION_DEFAULT_IMAGE_SIZE = 299
 
 
-def get_inception_model(inceptionv3=False):
-  if inceptionv3:
-    return tfhub.load(
-      'https://tfhub.dev/google/imagenet/inception_v3/feature_vector/4')
-  else:
-    return tfhub.load(INCEPTION_TFHUB)
+class InceptionV3(nn.Module):
+  """Inception v3 model for feature extraction."""
+  def __init__(self, normalize_input=False):
+    super(InceptionV3, self).__init__()
+    self.normalize_input = normalize_input
+    inception = inception_v3(pretrained=True, transform_input=False)
+    
+    # Extract the layers we need
+    self.Conv2d_1a_3x3 = inception.Conv2d_1a_3x3
+    self.Conv2d_2a_3x3 = inception.Conv2d_2a_3x3
+    self.Conv2d_2b_3x3 = inception.Conv2d_2b_3x3
+    self.Conv2d_3b_1x1 = inception.Conv2d_3b_1x1
+    self.Conv2d_4a_3x3 = inception.Conv2d_4a_3x3
+    self.Mixed_5b = inception.Mixed_5b
+    self.Mixed_5c = inception.Mixed_5c
+    self.Mixed_5d = inception.Mixed_5d
+    self.Mixed_6a = inception.Mixed_6a
+    self.Mixed_6b = inception.Mixed_6b
+    self.Mixed_6c = inception.Mixed_6c
+    self.Mixed_6d = inception.Mixed_6d
+    self.Mixed_6e = inception.Mixed_6e
+    self.Mixed_7a = inception.Mixed_7a
+    self.Mixed_7b = inception.Mixed_7b
+    self.Mixed_7c = inception.Mixed_7c
+    
+    # For logits
+    self.fc = inception.fc
+    
+  def forward(self, x):
+    if self.normalize_input:
+      x = (x - 0.5) * 2.0  # Normalize to [-1, 1]
+    
+    # Inception v3 forward pass
+    x = self.Conv2d_1a_3x3(x)
+    x = self.Conv2d_2a_3x3(x)
+    x = self.Conv2d_2b_3x3(x)
+    x = F.max_pool2d(x, kernel_size=3, stride=2)
+    x = self.Conv2d_3b_1x1(x)
+    x = self.Conv2d_4a_3x3(x)
+    x = F.max_pool2d(x, kernel_size=3, stride=2)
+    x = self.Mixed_5b(x)
+    x = self.Mixed_5c(x)
+    x = self.Mixed_5d(x)
+    x = self.Mixed_6a(x)
+    x = self.Mixed_6b(x)
+    x = self.Mixed_6c(x)
+    x = self.Mixed_6d(x)
+    x = self.Mixed_6e(x)
+    x = self.Mixed_7a(x)
+    x = self.Mixed_7b(x)
+    x = self.Mixed_7c(x)
+    
+    # Pool3: adaptive average pooling
+    pool3 = F.adaptive_avg_pool2d(x, (1, 1))
+    pool3 = pool3.view(pool3.size(0), -1)
+    
+    # Logits
+    logits = self.fc(pool3)
+    
+    return pool3, logits
+
+
+def get_inception_model(inceptionv3=False, device='cuda'):
+  """Get Inception model for feature extraction."""
+  model = InceptionV3(normalize_input=True)
+  model.eval()
+  model = model.to(device)
+  return model
 
 
 def load_dataset_stats(config):
@@ -51,96 +107,132 @@ def load_dataset_stats(config):
   else:
     raise ValueError(f'Dataset {config.data.dataset} stats not found.')
 
-  with tf.io.gfile.GFile(filename, 'rb') as fin:
+  with open(filename, 'rb') as fin:
     stats = np.load(fin)
     return stats
 
 
-def classifier_fn_from_tfhub(output_fields, inception_model,
-                             return_tensor=False):
-  """Returns a function that can be as a classifier function.
-
-  Copied from tfgan but avoid loading the model each time calling _classifier_fn
-
-  Args:
-    output_fields: A string, list, or `None`. If present, assume the module
-      outputs a dictionary, and select this field.
-    inception_model: A model loaded from TFHub.
-    return_tensor: If `True`, return a single tensor instead of a dictionary.
-
-  Returns:
-    A one-argument function that takes an image Tensor and returns outputs.
-  """
-  if isinstance(output_fields, six.string_types):
-    output_fields = [output_fields]
-
-  def _classifier_fn(images):
-    output = inception_model(images)
-    if output_fields is not None:
-      output = {x: output[x] for x in output_fields}
-    if return_tensor:
-      assert len(output) == 1
-      output = list(output.values())[0]
-    return tf.nest.map_structure(tf.compat.v1.layers.flatten, output)
-
-  return _classifier_fn
-
-
-@tf.function
-def run_inception_jit(inputs,
-                      inception_model,
-                      num_batches=1,
-                      inceptionv3=False):
+def run_inception_jit(inputs, inception_model, num_batches=1, inceptionv3=False, device='cuda'):
   """Running the inception network. Assuming input is within [0, 255]."""
+  # Convert numpy array to torch tensor if needed
+  if isinstance(inputs, np.ndarray):
+    inputs = torch.from_numpy(inputs).float()
+  
+  # Normalize to [-1, 1] for Inception
   if not inceptionv3:
-    inputs = (tf.cast(inputs, tf.float32) - 127.5) / 127.5
+    inputs = (inputs - 127.5) / 127.5
   else:
-    inputs = tf.cast(inputs, tf.float32) / 255.
+    inputs = inputs / 255.0
+    inputs = (inputs - 0.5) * 2.0  # Normalize to [-1, 1]
 
-  return tfgan.eval.run_classifier_fn(
-    inputs,
-    num_batches=num_batches,
-    classifier_fn=classifier_fn_from_tfhub(None, inception_model),
-    dtypes=_DEFAULT_DTYPES)
+  # Move to device and ensure correct shape [B, C, H, W]
+  if inputs.dim() == 4 and inputs.shape[-1] == 3:
+    # Convert from [B, H, W, C] to [B, C, H, W]
+    inputs = inputs.permute(0, 3, 1, 2)
+  
+  inputs = inputs.to(device)
+  
+  # Resize to Inception input size
+  if inputs.shape[2] != INCEPTION_DEFAULT_IMAGE_SIZE or inputs.shape[3] != INCEPTION_DEFAULT_IMAGE_SIZE:
+    inputs = F.interpolate(inputs, size=(INCEPTION_DEFAULT_IMAGE_SIZE, INCEPTION_DEFAULT_IMAGE_SIZE), 
+                          mode='bilinear', align_corners=False)
+
+  with torch.no_grad():
+    pool3, logits = inception_model(inputs)
+    
+    pool3 = pool3.cpu().numpy()
+    if not inceptionv3:
+      logits = logits.cpu().numpy()
+    else:
+      logits = None
+
+  return {
+    'pool_3': pool3,
+    'logits': logits
+  }
 
 
-@tf.function
-def run_inception_distributed(input_tensor,
-                              inception_model,
-                              num_batches=1,
-                              inceptionv3=False):
-  """Distribute the inception network computation to all available TPUs.
-
+def run_inception_distributed(input_tensor, inception_model, num_batches=1, inceptionv3=False, device='cuda'):
+  """Run inception network on input tensor.
+  
   Args:
-    input_tensor: The input images. Assumed to be within [0, 255].
-    inception_model: The inception network model obtained from `tfhub`.
+    input_tensor: The input images as numpy array. Assumed to be within [0, 255].
+    inception_model: The inception network model.
     num_batches: The number of batches used for dividing the input.
-    inceptionv3: If `True`, use InceptionV3, otherwise use InceptionV1.
+    inceptionv3: If `True`, use InceptionV3, otherwise use InceptionV1-style.
+    device: Device to run the model on.
 
   Returns:
     A dictionary with key `pool_3` and `logits`, representing the pool_3 and
       logits of the inception network respectively.
   """
-  num_tpus = jax.local_device_count()
-  input_tensors = tf.split(input_tensor, num_tpus, axis=0)
-  pool3 = []
-  logits = [] if not inceptionv3 else None
-  device_format = '/TPU:{}' if 'TPU' in str(jax.devices()[0]) else '/GPU:{}'
-  for i, tensor in enumerate(input_tensors):
-    with tf.device(device_format.format(i)):
-      tensor_on_device = tf.identity(tensor)
-      res = run_inception_jit(
-        tensor_on_device, inception_model, num_batches=num_batches,
-        inceptionv3=inceptionv3)
+  # Convert to numpy if torch tensor
+  if isinstance(input_tensor, torch.Tensor):
+    input_tensor = input_tensor.cpu().numpy()
+  
+  # Process in batches to avoid memory issues
+  batch_size = 50  # Process 50 images at a time
+  all_pool3 = []
+  all_logits = []
+  
+  for i in range(0, len(input_tensor), batch_size):
+    batch = input_tensor[i:i+batch_size]
+    result = run_inception_jit(batch, inception_model, num_batches=num_batches, 
+                               inceptionv3=inceptionv3, device=device)
+    all_pool3.append(result['pool_3'])
+    if result['logits'] is not None:
+      all_logits.append(result['logits'])
 
-      if not inceptionv3:
-        pool3.append(res['pool_3'])
-        logits.append(res['logits'])  # pytype: disable=attribute-error
-      else:
-        pool3.append(res)
+  return {
+    'pool_3': np.concatenate(all_pool3, axis=0),
+    'logits': np.concatenate(all_logits, axis=0) if all_logits else None
+  }
 
-  with tf.device('/CPU'):
-    return {
-      'pool_3': tf.concat(pool3, axis=0),
-      'logits': tf.concat(logits, axis=0) if not inceptionv3 else None
-    }
+
+def compute_inception_score(logits, splits=10):
+  """Compute Inception Score from logits."""
+  scores = []
+  for i in range(splits):
+    part = logits[i * (len(logits) // splits): (i + 1) * (len(logits) // splits)]
+    py = np.mean(part, axis=0)
+    scores.append(np.exp(np.mean([np.sum(p * np.log(p / py + 1e-10)) for p in part])))
+  return np.mean(scores)
+
+
+def compute_fid(real_features, fake_features):
+  """Compute Frechet Inception Distance."""
+  mu1, sigma1 = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
+  mu2, sigma2 = fake_features.mean(axis=0), np.cov(fake_features, rowvar=False)
+  
+  ssdiff = np.sum((mu1 - mu2) ** 2.0)
+  covmean = linalg.sqrtm(sigma1.dot(sigma2))
+  
+  if np.iscomplexobj(covmean):
+    covmean = covmean.real
+  
+  fid = ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean)
+  return fid
+
+
+def compute_kid(real_features, fake_features, max_subset_size=1000):
+  """Compute Kernel Inception Distance."""
+  n_samples_real = len(real_features)
+  n_samples_fake = len(fake_features)
+  
+  n_subsets = max(1, n_samples_real // max_subset_size)
+  n = min(n_samples_real, n_samples_fake, max_subset_size)
+  
+  t = 0
+  for _ in range(n_subsets):
+    x = real_features[np.random.choice(n_samples_real, n, replace=False)]
+    y = fake_features[np.random.choice(n_samples_fake, n, replace=False)]
+    
+    # Polynomial kernel of degree 3
+    kxx = (np.dot(x, x.T) / n + 1) ** 3
+    kyy = (np.dot(y, y.T) / n + 1) ** 3
+    kxy = (np.dot(x, y.T) / n + 1) ** 3
+    
+    t += np.mean(kxx) + np.mean(kyy) - 2 * np.mean(kxy)
+  
+  kid = t / n_subsets
+  return kid
