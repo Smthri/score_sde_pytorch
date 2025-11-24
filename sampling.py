@@ -397,16 +397,17 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
     """
     with torch.no_grad():
       # Initial sample
-      x = sde.prior_sampling(shape).to(device)
+      x = sde.prior_sampling(shape).to(device).float()
       timesteps = torch.linspace(sde.T, eps, sde.N, device=device)
 
       for i in range(sde.N):
         t = timesteps[i]
-        vec_t = torch.ones(shape[0], device=t.device) * t
+        vec_t = torch.ones(shape[0], device=t.device, dtype=x.dtype) * t
         x, x_mean = corrector_update_fn(x, vec_t, model=model)
         x, x_mean = predictor_update_fn(x, vec_t, model=model)
 
-      return inverse_scaler(x_mean if denoise else x), sde.N * (n_steps + 1)
+      final = x_mean if denoise else x
+      return inverse_scaler(final).float(), sde.N * (n_steps + 1)
 
   return pc_sampler
 
@@ -459,13 +460,13 @@ def get_ode_sampler(sde, shape, inverse_scaler,
       # Initial sample
       if z is None:
         # If not represent, sample the latent code from the prior distibution of the SDE.
-        x = sde.prior_sampling(shape).to(device)
+        x = sde.prior_sampling(shape).to(device).float()
       else:
         x = z
 
       def ode_func(t, x):
-        x = from_flattened_numpy(x, shape).to(device).type(torch.float32)
-        vec_t = torch.ones(shape[0], device=x.device) * t
+        x = from_flattened_numpy(x, shape).to(device).float()
+        vec_t = torch.ones(shape[0], device=x.device, dtype=x.dtype) * t
         drift = drift_fn(model, x, vec_t)
         return to_flattened_numpy(drift)
 
@@ -473,13 +474,13 @@ def get_ode_sampler(sde, shape, inverse_scaler,
       solution = integrate.solve_ivp(ode_func, (sde.T, eps), to_flattened_numpy(x),
                                      rtol=rtol, atol=atol, method=method)
       nfe = solution.nfev
-      x = torch.tensor(solution.y[:, -1]).reshape(shape).to(device).type(torch.float32)
+      x = torch.tensor(solution.y[:, -1]).reshape(shape).to(device).float()
 
       # Denoising is equivalent to running one predictor step without adding noise
       if denoise:
         x = denoise_update_fn(model, x)
 
-      x = inverse_scaler(x)
+      x = inverse_scaler(x).float()
       return x, nfe
 
   return ode_sampler
