@@ -41,6 +41,13 @@ from torch.utils import tensorboard
 from torchvision.utils import make_grid, save_image
 from utils import save_checkpoint, restore_checkpoint
 
+try:
+    import mlflow
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    logging.warning("MLflow not available. Install with: pip install mlflow")
+
 FLAGS = flags.FLAGS
 
 
@@ -72,6 +79,26 @@ def train(config, workdir):
         f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Created tensorboard directory: {tb_dir}"
     )
     writer = tensorboard.SummaryWriter(tb_dir)
+
+    # Initialize MLflow if available
+    if MLFLOW_AVAILABLE:
+        mlflow.set_tracking_uri(os.path.join(workdir, "mlruns"))
+        mlflow.set_experiment(f"score_sde_{config.data.dataset}")
+        mlflow.start_run(run_name=f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] MLflow initialized"
+        )
+        # Log hyperparameters
+        mlflow.log_params({
+            "model_name": config.model.name,
+            "dataset": config.data.dataset,
+            "image_size": config.data.image_size,
+            "batch_size": config.training.batch_size,
+            "learning_rate": config.optim.lr,
+            "sde": config.training.sde,
+            "continuous": config.training.continuous,
+            "n_iters": config.training.n_iters,
+        })
 
     # Initialize model.
     logging.info(
@@ -191,6 +218,7 @@ def train(config, workdir):
     )
 
     # Building sampling functions
+    sampling_fn = None
     if config.training.snapshot_sampling:
         sampling_shape = (
             config.training.batch_size,
@@ -201,6 +229,125 @@ def train(config, workdir):
         sampling_fn = sampling.get_sampling_fn(
             config, sde, sampling_shape, inverse_scaler, sampling_eps
         )
+    else:
+        # Create sampling function for FID calculation even if snapshot_sampling is disabled
+        sampling_shape = (
+            config.training.batch_size,
+            config.data.num_channels,
+            config.data.image_size,
+            config.data.image_size,
+        )
+        sampling_fn = sampling.get_sampling_fn(
+            config, sde, sampling_shape, inverse_scaler, sampling_eps
+        )
+
+    # Setup Inception model for FID calculation on validation set
+    inceptionv3 = config.data.image_size >= 256
+    device = config.device if hasattr(config, "device") else "cuda"
+    inception_model = None
+    try:
+        inception_model = evaluation.get_inception_model(inceptionv3=inceptionv3, device=device)
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Inception model loaded for FID calculation (inceptionv3={inceptionv3})"
+        )
+    except Exception as e:
+        logging.warning(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Failed to load Inception model for FID: {e}"
+        )
+
+    def compute_fid_on_validation(num_samples=5000):
+        """Compute FID score on validation set by comparing generated samples with validation samples."""
+        if inception_model is None:
+            logging.warning(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cannot compute FID: Inception model not available"
+            )
+            return None
+
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Computing FID on validation set with {num_samples} samples"
+        )
+        
+        # Collect validation samples
+        validation_samples = []
+        val_iter_temp = iter(eval_ds)
+        num_val_batches = min(num_samples // config.training.batch_size + 1, len(eval_ds))
+        
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Collecting {num_val_batches} batches of validation samples"
+        )
+        for i in range(num_val_batches):
+            try:
+                batch_dict = next(val_iter_temp)
+            except StopIteration:
+                val_iter_temp = iter(eval_ds)
+                batch_dict = next(val_iter_temp)
+            
+            val_batch = batch_dict["image"].to(config.device).float()
+            # Convert from [B, H, W, C] to [B, C, H, W] if needed
+            if val_batch.dim() == 4 and val_batch.shape[-1] == 3:
+                val_batch = val_batch.permute(0, 3, 1, 2)
+            # Denormalize and convert to uint8
+            val_batch = inverse_scaler(val_batch)
+            val_batch = torch.clamp(val_batch, 0, 1)
+            val_batch_np = (val_batch.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+            validation_samples.append(val_batch_np)
+        
+        validation_samples = np.concatenate(validation_samples, axis=0)[:num_samples]
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Collected {len(validation_samples)} validation samples"
+        )
+
+        # Generate samples from model
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Generating {num_samples} samples for FID calculation"
+        )
+        ema.store(score_model.parameters())
+        ema.copy_to(score_model.parameters())
+        
+        generated_samples = []
+        num_gen_batches = num_samples // config.training.batch_size + 1
+        for i in range(num_gen_batches):
+            gen_sample, _ = sampling_fn(score_model)
+            gen_sample = torch.clamp(gen_sample, 0, 1)
+            gen_sample_np = (gen_sample.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+            generated_samples.append(gen_sample_np)
+        
+        ema.restore(score_model.parameters())
+        generated_samples = np.concatenate(generated_samples, axis=0)[:num_samples]
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Generated {len(generated_samples)} samples"
+        )
+
+        # Compute Inception features
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Computing Inception features for validation samples"
+        )
+        gc.collect()
+        val_latents = evaluation.run_inception_distributed(
+            validation_samples, inception_model, inceptionv3=inceptionv3, device=device
+        )
+        val_pools = val_latents["pool_3"]
+        
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Computing Inception features for generated samples"
+        )
+        gc.collect()
+        gen_latents = evaluation.run_inception_distributed(
+            generated_samples, inception_model, inceptionv3=inceptionv3, device=device
+        )
+        gen_pools = gen_latents["pool_3"]
+        gc.collect()
+
+        # Compute FID
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Computing FID score"
+        )
+        fid_score = evaluation.compute_fid(val_pools, gen_pools)
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] FID score on validation set: {fid_score:.6f}"
+        )
+        
+        return fid_score
 
     num_train_steps = config.training.n_iters
     logging.info(
@@ -257,6 +404,9 @@ def train(config, workdir):
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] step: {step}, training_loss: {loss.item():.5e}"
             )
             writer.add_scalar("training_loss", loss, step)
+            # Log to MLflow
+            if MLFLOW_AVAILABLE:
+                mlflow.log_metric("training_loss", loss.item(), step=step)
 
         # Save a temporary checkpoint to resume training after pre-emption periodically
         if step != 0 and step % config.training.snapshot_freq_for_preemption == 0:
@@ -287,6 +437,9 @@ def train(config, workdir):
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] step: {step}, eval_loss: {eval_loss.item():.5e}"
             )
             writer.add_scalar("eval_loss", eval_loss.item(), step)
+            # Log to MLflow
+            if MLFLOW_AVAILABLE:
+                mlflow.log_metric("eval_loss", eval_loss.item(), step=step)
 
         # Save a checkpoint periodically and generate samples if needed
         if (
@@ -338,6 +491,35 @@ def train(config, workdir):
                 logging.info(
                     f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Saved image grid to {image_file}"
                 )
+
+        # Compute FID on validation set at snapshot frequency
+        if (
+            step != 0
+            and step % config.training.snapshot_freq == 0
+            or step == num_train_steps
+        ):
+            if inception_model is not None and sampling_fn is not None:
+                try:
+                    fid_score = compute_fid_on_validation(num_samples=5000)
+                    if fid_score is not None:
+                        logging.info(
+                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] FID on validation at step {step}: {fid_score:.6f}"
+                        )
+                        writer.add_scalar("fid_validation", fid_score, step)
+                        # Log to MLflow
+                        if MLFLOW_AVAILABLE:
+                            mlflow.log_metric("fid_validation", fid_score, step=step)
+                except Exception as e:
+                    logging.warning(
+                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Failed to compute FID: {e}"
+                    )
+
+    # End MLflow run
+    if MLFLOW_AVAILABLE:
+        mlflow.end_run()
+        logging.info(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] MLflow run ended"
+        )
 
 
 def evaluate(config, workdir, eval_folder="eval"):

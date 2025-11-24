@@ -6,3 +6,4 @@ ninja
 pillow
 scipy
 numpy
+mlflow
